@@ -145,6 +145,9 @@ pub struct Server {
 
     // result of TcpListener::local_addr()
     listening_addr: ListenAddr,
+
+    // single container unix socket connection, if provided
+    unix_stream: Option<std::os::unix::net::UnixStream>,
 }
 
 enum Message {
@@ -242,6 +245,40 @@ impl Server {
     pub fn new(config: ServerConfig) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
         let listener = config.addr.bind()?;
         Self::from_listener(listener, config.ssl)
+    }
+
+    /// Builds a new server directly from a unix stream.
+    ///
+    /// This is a hack to work around the fact that we can't directly bind a listener accessible
+    /// to the host in the container, as we don't use gVisor's shared mode, to protect the host.
+    /// Instead, we bind the listener in the host, mount it into the container, and use the
+    /// container's connection stream as the "server". Note that this means we only support a
+    /// single client here.
+    pub fn from_unix_stream(
+        stream: std::os::unix::net::UnixStream,
+    ) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
+        let close_trigger = Arc::new(AtomicBool::new(false));
+        let messages = MessagesQueue::with_capacity(8);
+
+        let stream_addr = stream.local_addr().unwrap();
+        let inside_stream = stream.try_clone().unwrap();
+        let (read_closable, write_closable) =
+            util::RefinedTcpStream::new(Connection::Unix(inside_stream));
+        let client = ClientConnection::new(write_closable, read_closable);
+
+        let inside_messages = messages.clone();
+        thread::spawn(move || {
+            for rq in client {
+                inside_messages.push(rq.into());
+            }
+        });
+
+        Ok(Server {
+            messages,
+            close: close_trigger,
+            listening_addr: ListenAddr::Unix(stream_addr),
+            unix_stream: Some(stream),
+        })
     }
 
     /// Builds a new server using the specified TCP listener.
@@ -390,6 +427,7 @@ impl Server {
             messages,
             close: close_trigger,
             listening_addr: local_addr,
+            unix_stream: None,
         })
     }
 
@@ -464,11 +502,18 @@ impl Drop for Server {
             #[cfg(unix)]
             ListenAddr::Unix(addr) => {
                 // TODO: use connect_addr when its stabilized.
-                let path = addr.as_pathname().unwrap();
-                std::os::unix::net::UnixStream::connect(path).map(Connection::from)
+                match addr.as_pathname() {
+                    Some(path) => std::os::unix::net::UnixStream::connect(path).map(Connection::from),
+                    None => Err(std::io::Error::new(std::io::ErrorKind::Other, "empty address")),
+                }
             }
         };
         if let Ok(stream) = maybe_stream {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+
+        // Clean up the connection if the daemon crashes.
+        if let Some(ref stream) = self.unix_stream {
             let _ = stream.shutdown(Shutdown::Both);
         }
 
